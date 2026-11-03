@@ -1,0 +1,18 @@
+{
+  "name": "virtual-audio-cable",
+  "version": "1.0.0",
+  "description": "Virtual audio cable with real-time microphone processing",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "build": "electron-builder"
+  },
+  "keywords": ["audio", "microphone", "processing", "virtual-cable"],
+  "author": "Sirin",
+  "license": "MIT",
+  "devDependencies": {
+    "electron": "^28.0.0",
+    "electron-builder": "^24.9.1"
+  },
+  "dependencies": {}
+}

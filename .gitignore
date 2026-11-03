@@ -9,3 +9,14 @@ $RECYCLE.BIN/
 # Temporary files
 *.tmp
 *~
+
+# Dependencies
+node_modules/
+
+# Build outputs
+dist/
+build/
+out/
+
+# Electron
+*.asar
