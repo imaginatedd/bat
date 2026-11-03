@@ -216,6 +216,28 @@
             transform: translateX(24px);
         }
 
+        .remove-vst-btn {
+            background: #ff4444;
+            border: none;
+            color: white;
+            width: 28px;
+            height: 28px;
+            border-radius: 50%;
+            cursor: pointer;
+            font-size: 1.1rem;
+            font-weight: bold;
+            transition: all 0.2s;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 0;
+        }
+
+        .remove-vst-btn:hover {
+            background: #ff6666;
+            transform: scale(1.1);
+        }
+
         .control-group {
             margin-bottom: 15px;
         }
@@ -361,6 +383,19 @@
                 <button class="preset-btn" data-preset="broadcast">Broadcast</button>
                 <button class="preset-btn" data-preset="vocal">Vocal Enhance</button>
                 <button class="preset-btn" data-preset="clean">Clean Voice</button>
+            </div>
+        </div>
+
+        <div class="control-panel" style="margin-bottom: 30px;">
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px;">
+                <h2 class="panel-title" style="margin: 0;">VST3 Plugins</h2>
+                <button id="loadVSTBtn" class="btn" style="width: auto; padding: 10px 20px; margin: 0;">Load VST3 Plugin</button>
+            </div>
+            <div id="vstPluginsContainer" class="effects-grid" style="margin: 0;">
+                <div style="background: #1a1a1a; border-radius: 8px; padding: 20px; text-align: center; color: #888;">
+                    <p style="margin: 0;">No VST3 plugins loaded</p>
+                    <p style="margin: 10px 0 0 0; font-size: 0.85rem;">Click "Load VST3 Plugin" to add plugins to your chain</p>
+                </div>
             </div>
         </div>
 

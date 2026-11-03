@@ -8,11 +8,13 @@ class AudioProcessor {
 
         // Effect nodes
         this.gateNode = null;
+        this.gateWorkletNode = null;
         this.compressorNode = null;
         this.eqNodes = { low: null, mid: null, high: null };
         this.reverbNode = null;
         this.deesserNode = null;
         this.gainNode = null;
+        this.vstPlugins = [];
 
         // Effect states
         this.effects = {
@@ -30,6 +32,15 @@ class AudioProcessor {
     async initialize() {
         try {
             this.audioContext = new (window.AudioContext || window.webkitAudioContext)();
+
+            // Load AudioWorklet for noise gate
+            try {
+                await this.audioContext.audioWorklet.addModule('noise-gate-processor.js');
+                console.log('AudioWorklet loaded successfully');
+            } catch (e) {
+                console.warn('AudioWorklet not available, using fallback gate');
+            }
+
             await this.loadDevices();
         } catch (error) {
             console.error('Failed to initialize audio:', error);
@@ -75,7 +86,7 @@ class AudioProcessor {
             };
 
             this.mediaStream = await navigator.mediaDevices.getUserMedia(constraints);
-            this.setupAudioGraph();
+            await this.setupAudioGraph();
             this.startVisualizer();
             this.isProcessing = true;
 
@@ -88,7 +99,7 @@ class AudioProcessor {
         }
     }
 
-    setupAudioGraph() {
+    async setupAudioGraph() {
         // Create source
         this.sourceNode = this.audioContext.createMediaStreamSource(this.mediaStream);
 
@@ -97,7 +108,7 @@ class AudioProcessor {
         this.analyserNode.fftSize = 2048;
 
         // Create effect nodes
-        this.setupNoiseGate();
+        await this.setupNoiseGate();
         this.setupCompressor();
         this.setupEQ();
         this.setupReverb();
@@ -108,13 +119,55 @@ class AudioProcessor {
         this.connectAudioGraph();
     }
 
-    setupNoiseGate() {
-        // Simple gate using gain node
-        this.gateNode = this.audioContext.createGain();
-        this.gateNode.gain.value = 1;
+    async setupNoiseGate() {
+        try {
+            // Try using AudioWorklet
+            this.gateWorkletNode = new AudioWorkletNode(this.audioContext, 'noise-gate-processor');
+            this.gateWorkletNode.port.postMessage({
+                type: 'threshold',
+                value: this.effects.gate.threshold
+            });
+            this.gateNode = this.gateWorkletNode;
+            console.log('Using AudioWorklet for noise gate');
+        } catch (e) {
+            // Fallback to ScriptProcessor
+            console.log('Using ScriptProcessor fallback for noise gate');
+            this.setupNoiseGateFallback();
+        }
+    }
 
-        // Implement simple gate logic with script processor fallback
-        // For production, use AudioWorklet
+    setupNoiseGateFallback() {
+        const bufferSize = 4096;
+        this.gateNode = this.audioContext.createScriptProcessor(bufferSize, 1, 1);
+
+        let envelope = 0;
+        let isOpen = false;
+        const attackTime = 0.001;
+        const releaseTime = 0.1;
+
+        this.gateNode.onaudioprocess = (e) => {
+            const input = e.inputBuffer.getChannelData(0);
+            const output = e.outputBuffer.getChannelData(0);
+            const threshold = this.effects.gate.threshold;
+
+            for (let i = 0; i < input.length; i++) {
+                const sample = input[i];
+                const level = Math.abs(sample);
+                const dbLevel = 20 * Math.log10(level + 0.0001);
+
+                if (dbLevel > threshold) {
+                    isOpen = true;
+                } else if (dbLevel < threshold - 6) {
+                    isOpen = false;
+                }
+
+                const target = isOpen ? 1 : 0;
+                const coeff = isOpen ? attackTime : releaseTime;
+                envelope += (target - envelope) * coeff;
+
+                output[i] = sample * envelope;
+            }
+        };
     }
 
     setupCompressor() {
@@ -189,7 +242,7 @@ class AudioProcessor {
         let currentNode = this.sourceNode;
 
         // Gate
-        if (this.effects.gate.enabled) {
+        if (this.effects.gate.enabled && this.gateNode) {
             currentNode.connect(this.gateNode);
             currentNode = this.gateNode;
         }
@@ -207,6 +260,14 @@ class AudioProcessor {
             this.eqNodes.mid.connect(this.eqNodes.high);
             currentNode = this.eqNodes.high;
         }
+
+        // VST3 Plugins
+        this.vstPlugins.forEach(plugin => {
+            if (plugin.enabled && plugin.node) {
+                currentNode.connect(plugin.node);
+                currentNode = plugin.node;
+            }
+        });
 
         // De-esser
         if (this.effects.deesser.enabled) {
@@ -247,6 +308,9 @@ class AudioProcessor {
             this.eqNodes.mid.disconnect();
             this.eqNodes.high.disconnect();
         }
+        this.vstPlugins.forEach(plugin => {
+            if (plugin.node) plugin.node.disconnect();
+        });
         if (this.reverbNode) {
             this.reverbNode.disconnect();
             this.reverbDry.disconnect();
@@ -265,6 +329,127 @@ class AudioProcessor {
         this.compressorNode.attack.value = 0.003;
         this.compressorNode.release.value = 0.25;
         this.compressorNode.knee.value = 30;
+    }
+
+    updateGateThreshold() {
+        if (this.gateWorkletNode && this.gateWorkletNode.port) {
+            this.gateWorkletNode.port.postMessage({
+                type: 'threshold',
+                value: this.effects.gate.threshold
+            });
+        }
+    }
+
+    async loadVST3Plugin() {
+        if (typeof window.electronAPI === 'undefined') {
+            alert('VST3 loading is only available in Electron environment');
+            return;
+        }
+
+        try {
+            const pluginPath = await window.electronAPI.openVST3Dialog();
+
+            if (!pluginPath) return;
+
+            const result = await window.electronAPI.loadVST3(pluginPath);
+
+            if (result.success) {
+                // Create a gain node as placeholder for VST3
+                const vstNode = this.audioContext.createGain();
+                vstNode.gain.value = 1;
+
+                const plugin = {
+                    id: result.pluginId,
+                    name: result.name,
+                    path: pluginPath,
+                    node: vstNode,
+                    enabled: true
+                };
+
+                this.vstPlugins.push(plugin);
+                this.addVSTPluginToUI(plugin);
+
+                alert(`VST3 plugin loaded: ${result.name}\n\nNote: Full VST3 processing requires native addon.`);
+
+                if (this.isProcessing) {
+                    this.disconnectAudioGraph();
+                    this.connectAudioGraph();
+                }
+            } else {
+                alert('Failed to load VST3: ' + result.error);
+            }
+        } catch (error) {
+            console.error('VST3 loading error:', error);
+            alert('Failed to load VST3 plugin: ' + error.message);
+        }
+    }
+
+    addVSTPluginToUI(plugin) {
+        const container = document.getElementById('vstPluginsContainer');
+
+        const pluginBlock = document.createElement('div');
+        pluginBlock.className = 'effect-block';
+        pluginBlock.id = `vst-${plugin.id}`;
+
+        pluginBlock.innerHTML = `
+            <div class="effect-header">
+                <span class="effect-title">🎛️ ${plugin.name}</span>
+                <div style="display: flex; gap: 10px; align-items: center;">
+                    <label class="toggle-switch">
+                        <input type="checkbox" class="vst-toggle" data-id="${plugin.id}" checked>
+                        <span class="slider"></span>
+                    </label>
+                    <button class="remove-vst-btn" data-id="${plugin.id}" title="Remove plugin">✕</button>
+                </div>
+            </div>
+            <div class="control-group">
+                <p style="color: #888; font-size: 0.85rem; margin: 0;">VST3 Plugin</p>
+                <p style="color: #888; font-size: 0.75rem; margin-top: 5px;">Path: ${plugin.path}</p>
+            </div>
+        `;
+
+        container.appendChild(pluginBlock);
+
+        // Add event listeners
+        pluginBlock.querySelector('.vst-toggle').addEventListener('change', (e) => {
+            plugin.enabled = e.target.checked;
+            if (this.isProcessing) {
+                this.disconnectAudioGraph();
+                this.connectAudioGraph();
+            }
+        });
+
+        pluginBlock.querySelector('.remove-vst-btn').addEventListener('click', () => {
+            this.removeVSTPlugin(plugin.id);
+        });
+    }
+
+    async removeVSTPlugin(pluginId) {
+        const index = this.vstPlugins.findIndex(p => p.id === pluginId);
+
+        if (index !== -1) {
+            const plugin = this.vstPlugins[index];
+
+            if (plugin.node) {
+                plugin.node.disconnect();
+            }
+
+            if (typeof window.electronAPI !== 'undefined') {
+                await window.electronAPI.unloadVST3(pluginId);
+            }
+
+            this.vstPlugins.splice(index, 1);
+
+            const element = document.getElementById(`vst-${pluginId}`);
+            if (element) {
+                element.remove();
+            }
+
+            if (this.isProcessing) {
+                this.disconnectAudioGraph();
+                this.connectAudioGraph();
+            }
+        }
     }
 
     startVisualizer() {
@@ -448,6 +633,8 @@ class AudioProcessor {
             this.reverbDry.gain.value = 1 - mix;
             this.reverbWet.gain.value = mix;
         }
+
+        this.updateGateThreshold();
     }
 
     updateAllDisplayValues() {
@@ -480,6 +667,9 @@ class AudioProcessor {
         document.getElementById('startBtn').addEventListener('click', () => this.start());
         document.getElementById('stopBtn').addEventListener('click', () => this.stop());
 
+        // Load VST3 button
+        document.getElementById('loadVSTBtn').addEventListener('click', () => this.loadVST3Plugin());
+
         // Preset buttons
         document.querySelectorAll('.preset-btn').forEach(btn => {
             btn.addEventListener('click', (e) => {
@@ -511,7 +701,7 @@ class AudioProcessor {
 
         // Sliders
         const sliders = [
-            { id: 'gateThreshold', effect: 'gate', prop: 'threshold', format: ' dB' },
+            { id: 'gateThreshold', effect: 'gate', prop: 'threshold', format: ' dB', callback: () => this.updateGateThreshold() },
             { id: 'compThreshold', effect: 'compressor', prop: 'threshold', format: ' dB' },
             { id: 'compRatio', effect: 'compressor', prop: 'ratio', format: ':1' },
             { id: 'eqLow', effect: 'eq', prop: 'low', format: ' dB' },
@@ -524,7 +714,7 @@ class AudioProcessor {
             { id: 'gain', effect: 'output', prop: 'gain', format: ' dB' }
         ];
 
-        sliders.forEach(({ id, effect, prop, format }) => {
+        sliders.forEach(({ id, effect, prop, format, callback }) => {
             const slider = document.getElementById(id);
             const valueDisplay = document.getElementById(id + 'Value');
 
@@ -532,6 +722,8 @@ class AudioProcessor {
                 const value = parseFloat(e.target.value);
                 this.effects[effect][prop] = value;
                 valueDisplay.textContent = value + format;
+
+                if (callback) callback();
 
                 if (this.isProcessing) {
                     this.applyEffectChanges();
