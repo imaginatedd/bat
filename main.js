@@ -85,6 +85,21 @@ class Vst3Host {
     return msg.value;
   }
 
+  async setup(sampleRate, blockSize) {
+    const msg = await this.send('setup\t' + sampleRate + '\t' + blockSize);
+    if (msg.type === 'error') throw new Error(msg.message);
+    return msg;
+  }
+
+  // samples: Float32Array (mono). Returns a Float32Array (mono).
+  async process(samples) {
+    const b64 = Buffer.from(samples.buffer, samples.byteOffset, samples.byteLength).toString('base64');
+    const msg = await this.send('process\t' + samples.length + '\t' + b64);
+    if (msg.type === 'error') throw new Error(msg.message);
+    const bytes = Buffer.from(msg.data, 'base64');
+    return new Float32Array(bytes.buffer, bytes.byteOffset, bytes.byteLength / 4);
+  }
+
   async unload() {
     try { await this.send('unload'); } catch (e) { /* ignore */ }
   }
@@ -132,6 +147,10 @@ ipcMain.handle('get-worklet-source', () => {
   return fs.readFileSync(path.join(__dirname, 'noise-gate-processor.js'), 'utf8');
 });
 
+ipcMain.handle('get-vst3-bridge-source', () => {
+  return fs.readFileSync(path.join(__dirname, 'vst3-bridge-processor.js'), 'utf8');
+});
+
 // --- VST3 plugin management -----------------------------------------------
 
 ipcMain.handle('open-vst3-dialog', async () => {
@@ -175,7 +194,8 @@ ipcMain.handle('load-vst3', async (event, pluginPath) => {
       name: pluginName,
       path: pluginPath,
       host,
-      parameters
+      parameters,
+      audioReady: false
     });
 
     return {
@@ -189,14 +209,22 @@ ipcMain.handle('load-vst3', async (event, pluginPath) => {
   }
 });
 
-ipcMain.handle('process-vst3', async (event, pluginId, audioData) => {
+ipcMain.handle('process-vst3', async (event, pluginId, audioData, info) => {
   const plugin = vstPlugins.get(pluginId);
   if (!plugin) {
     return { success: false, error: 'Plugin not found' };
   }
-  // Real-time audio processing through the plugin is not wired up yet;
-  // pass the buffer through unchanged.
-  return { success: true, audioData };
+  try {
+    // Configure the processor once, on the first audio block.
+    if (!plugin.audioReady) {
+      await plugin.host.setup(info.sampleRate, info.blockSize);
+      plugin.audioReady = true;
+    }
+    const processed = await plugin.host.process(audioData);
+    return { success: true, audioData: processed };
+  } catch (error) {
+    return { success: false, error: error.message };
+  }
 });
 
 ipcMain.handle('unload-vst3', async (event, pluginId) => {
