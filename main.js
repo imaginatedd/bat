@@ -10,8 +10,8 @@ function createWindow() {
     width: 1400,
     height: 900,
     webPreferences: {
-      nodeIntegration: true,
-      contextIsolation: false,
+      nodeIntegration: false,
+      contextIsolation: true,
       preload: path.join(__dirname, 'preload.js')
     },
     title: 'Virtual Audio Cable',
@@ -68,6 +68,16 @@ ipcMain.handle('load-vst3', async (event, pluginPath) => {
       error: error.message
     };
   }
+});
+
+ipcMain.handle('process-vst3', async (event, pluginId, audioData) => {
+  const plugin = vstPlugins.get(pluginId);
+  if (!plugin) {
+    return { success: false, error: 'Plugin not found' };
+  }
+  // Placeholder: real VST3 processing requires a native addon.
+  // Audio is passed through unchanged for now.
+  return { success: true, audioData };
 });
 
 ipcMain.handle('unload-vst3', async (event, pluginId) => {
