@@ -1,28 +1,36 @@
 // vst3_host.cpp
-// Minimal VST3 host bridge: loads a .vst3, enumerates/reads/writes parameters
-// over a simple line protocol on stdin/stdout. Used by the Electron main process.
+// Minimal VST3 host bridge: loads a .vst3, enumerates/reads/writes parameters,
+// and processes audio blocks through the plugin over a line protocol on
+// stdin/stdout. Used by the Electron main process.
+//
+// Audio is exchanged MONO: the host up-mixes the mono input to the plugin's
+// input channel count and down-mixes the plugin's output back to mono. This
+// hides the plugin's channel configuration from the Electron side.
 //
 // Input commands (one per line, tab-separated):
-//   load\t<path>                 load a .vst3 file
-//   get\t<paramId>               read one parameter (normalized 0..1)
-//   set\t<paramId>\t<value>      write one parameter (normalized 0..1)
-//   unload                       release the loaded plugin
-//   quit                         exit
+//   load\t<path>                  load a .vst3 file
+//   setup\t<sampleRate>\t<blockSize>  configure the audio processor
+//   get\t<paramId>                read one parameter (normalized 0..1)
+//   set\t<paramId>\t<value>       write one parameter (normalized 0..1)
+//   process\t<numSamples>\t<base64>   process a mono float32 block (LE)
+//   unload                        release the loaded plugin
+//   quit                          exit
 //
 // Output: one JSON object per line (UTF-8):
-//   {"type":"loaded","params":[{"id":1,"title":"Gain","value":0.5,"units":"dB"}, ...]}
+//   {"type":"loaded","params":[...],"numInCh":2,"numOutCh":2}
+//   {"type":"ready"}
 //   {"type":"param","id":1,"value":0.5}
+//   {"type":"audio","numSamples":128,"data":"<base64 mono float32>"}
 //   {"type":"unloaded"}
 //   {"type":"error","message":"..."}
 //
-// Build instructions: see README.md in this directory.
-// Targets the Steinberg VST3 SDK (3.7.x). If your SDK version renames an
-// FUnknown macro or IHostApplication method, adjust the single spot below.
+// Build instructions: see README.md. Targets the Steinberg VST3 SDK (3.7.x).
 
 #include "pluginterfaces/base/funknown.h"
 #include "pluginterfaces/base/ipluginbase.h"
 #include "pluginterfaces/vst/ivstcomponent.h"
 #include "pluginterfaces/vst/ivsteditcontroller.h"
+#include "pluginterfaces/vst/ivstaudioprocessor.h"
 #include "pluginterfaces/vst/ivsthostapplication.h"
 #include "pluginterfaces/vst/ivstcomponenthandler.h"
 #include "base/source/fobject.h"
@@ -35,6 +43,7 @@
 #include <iostream>
 #include <sstream>
 #include <string>
+#include <vector>
 
 using namespace Steinberg;
 using namespace Steinberg::Vst;
@@ -82,19 +91,63 @@ static std::string jsonEscape(const std::string& s) {
   return o;
 }
 
-// --- Host context (implements the interfaces the plugin queries) -----------
+// --- Base64 ----------------------------------------------------------------
+
+static const char kB64[] =
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+static std::string base64Encode(const uint8_t* data, size_t len) {
+  std::string out;
+  out.reserve(((len + 2) / 3) * 4);
+  for (size_t i = 0; i < len; i += 3) {
+    uint32_t n = (uint32_t)data[i] << 16;
+    if (i + 1 < len) n |= (uint32_t)data[i + 1] << 8;
+    if (i + 2 < len) n |= (uint32_t)data[i + 2];
+    out += kB64[(n >> 18) & 63];
+    out += kB64[(n >> 12) & 63];
+    out += (i + 1 < len) ? kB64[(n >> 6) & 63] : '=';
+    out += (i + 2 < len) ? kB64[n & 63] : '=';
+  }
+  return out;
+}
+
+static std::vector<uint8_t> base64Decode(const std::string& s) {
+  auto val = [](char c) -> int {
+    if (c >= 'A' && c <= 'Z') return c - 'A';
+    if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+    if (c >= '0' && c <= '9') return c - '0' + 52;
+    if (c == '+') return 62;
+    if (c == '/') return 63;
+    return -1;
+  };
+  std::vector<uint8_t> out;
+  out.reserve((s.size() * 3) / 4);
+  int buf = 0, bits = 0;
+  for (char c : s) {
+    if (c == '=' || c == '\n' || c == '\r') continue;
+    int v = val(c);
+    if (v < 0) continue;
+    buf = (buf << 6) | v;
+    bits += 6;
+    if (bits >= 8) {
+      bits -= 8;
+      out.push_back((uint8_t)((buf >> bits) & 0xFF));
+    }
+  }
+  return out;
+}
+
+// --- Host context ----------------------------------------------------------
 
 class HostContext : public FObject,
                     public IComponentHandler,
                     public IHostApplication {
  public:
-  // IComponentHandler
   tresult PLUGIN_API beginEdit(ParamID) override { return kResultOk; }
   tresult PLUGIN_API performEdit(ParamID, ParamValue) override { return kResultOk; }
   tresult PLUGIN_API endEdit(ParamID) override { return kResultOk; }
   tresult PLUGIN_API restartComponent(int32) override { return kResultOk; }
 
-  // IHostApplication
   tresult PLUGIN_API getName(String128 name) override;
   tresult PLUGIN_API createInstance(TUID, TUID, void** obj) override {
     if (obj) *obj = nullptr;
@@ -123,7 +176,12 @@ struct Plugin {
   IPluginFactory* factory = nullptr;
   IComponent* component = nullptr;
   IEditController* controller = nullptr;
+  IAudioProcessor* processor = nullptr;
   HostContext* hostContext = nullptr;
+
+  int32 numInCh = 0;
+  int32 numOutCh = 0;
+  bool processing = false;
 
   ~Plugin() { unload(); }
 
@@ -143,6 +201,10 @@ struct Plugin {
       factory->release();
       factory = nullptr;
     }
+    if (processor) {
+      processor->release();
+      processor = nullptr;
+    }
     if (hostContext) {
       hostContext->release();
       hostContext = nullptr;
@@ -151,6 +213,7 @@ struct Plugin {
       FreeLibrary(module);
       module = nullptr;
     }
+    processing = false;
   }
 };
 
@@ -175,7 +238,6 @@ static bool loadPlugin(Plugin& p, const std::string& path) {
   }
   p.factory = factory;
 
-  // Find the first audio-effect class (skip instruments/other categories).
   TUID cid;
   bool found = false;
   for (int32 i = 0; i < factory->countClasses(); i++) {
@@ -215,15 +277,45 @@ static bool loadPlugin(Plugin& p, const std::string& path) {
   component->initialize(p.hostContext);
   controller->initialize(p.hostContext);
   controller->setComponentHandler(p.hostContext);
-  component->setActive(true);
 
+  // Audio processor (required for audio effects).
+  IAudioProcessor* processor = nullptr;
+  if (component->queryInterface(IAudioProcessor::iid, (void**)&processor) != kResultOk || !processor) {
+    p.unload();
+    return false;
+  }
+  p.processor = processor;
+
+  // Activate all audio buses and read the first bus channel counts.
+  for (int32 i = 0; i < component->getBusCount(kAudio, kInput); i++) {
+    component->activateBus(kAudio, kInput, i, true);
+  }
+  for (int32 i = 0; i < component->getBusCount(kAudio, kOutput); i++) {
+    component->activateBus(kAudio, kOutput, i, true);
+  }
+  if (component->getBusCount(kAudio, kInput) > 0) {
+    BusInfo bi = {};
+    if (component->getBusInfo(kAudio, kInput, 0, &bi) == kResultOk) p.numInCh = bi.channelCount;
+  }
+  if (component->getBusCount(kAudio, kOutput) > 0) {
+    BusInfo bi = {};
+    if (component->getBusInfo(kAudio, kOutput, 0, &bi) == kResultOk) p.numOutCh = bi.channelCount;
+  }
+  if (p.numInCh <= 0 || p.numOutCh <= 0) {
+    p.unload();
+    return false;
+  }
+
+  component->setActive(true);
   return true;
 }
 
 static void emitParams(Plugin& p) {
   IEditController* ctrl = p.controller;
   std::ostringstream js;
-  js << "{\"type\":\"loaded\",\"params\":[";
+  js << "{\"type\":\"loaded\",\"numInCh\":" << p.numInCh
+     << ",\"numOutCh\":" << p.numOutCh
+     << ",\"params\":[";
   int32 n = ctrl->getParameterCount();
   bool first = true;
   for (int32 i = 0; i < n; i++) {
@@ -242,6 +334,74 @@ static void emitParams(Plugin& p) {
   std::cout << js.str() << "\n" << std::flush;
 }
 
+static bool setupProcessing(Plugin& p, double sampleRate, int32 blockSize) {
+  if (!p.processor) return false;
+  ProcessSetup setup = {};
+  setup.processMode = kRealtime;
+  setup.symbolicSampleSize = kSample32;
+  setup.maxSamplesPerBlock = blockSize;
+  setup.sampleRate = sampleRate;
+  if (p.processor->setupProcessing(setup) != kResultOk) return false;
+  if (p.processor->setProcessing(true) != kResultOk) return false;
+  p.processing = true;
+  return true;
+}
+
+static void processAudio(Plugin& p, int32 numSamples, const std::string& b64) {
+  if (!p.processor || !p.processing) {
+    std::cout << "{\"type\":\"error\",\"message\":\"processor not ready\"}\n" << std::flush;
+    return;
+  }
+
+  std::vector<uint8_t> bytes = base64Decode(b64);
+  if (bytes.size() < (size_t)numSamples * 4) {
+    std::cout << "{\"type\":\"error\",\"message\":\"bad audio payload\"}\n" << std::flush;
+    return;
+  }
+  const float* mono = reinterpret_cast<const float*>(bytes.data());
+
+  // Up-mix mono -> plugin input channels.
+  std::vector<std::vector<float>> in((size_t)p.numInCh, std::vector<float>((size_t)numSamples, 0.f));
+  for (int32 s = 0; s < numSamples; s++) {
+    for (int32 c = 0; c < p.numInCh; c++) in[c][s] = mono[s];
+  }
+  std::vector<std::vector<float>> out((size_t)p.numOutCh, std::vector<float>((size_t)numSamples, 0.f));
+
+  std::vector<float*> inPtrs((size_t)p.numInCh), outPtrs((size_t)p.numOutCh);
+  for (int32 c = 0; c < p.numInCh; c++) inPtrs[c] = in[c].data();
+  for (int32 c = 0; c < p.numOutCh; c++) outPtrs[c] = out[c].data();
+
+  AudioBusBuffers inBus = {};
+  inBus.numChannels = p.numInCh;
+  inBus.channelBuffers32 = inPtrs.data();
+  AudioBusBuffers outBus = {};
+  outBus.numChannels = p.numOutCh;
+  outBus.channelBuffers32 = outPtrs.data();
+
+  ProcessData data = {};
+  data.processMode = kRealtime;
+  data.symbolicSampleSize = kSample32;
+  data.numSamples = numSamples;
+  data.numInputs = 1;
+  data.numOutputs = 1;
+  data.inputs = &inBus;
+  data.outputs = &outBus;
+
+  p.processor->process(data);
+
+  // Down-mix plugin output -> mono.
+  std::vector<float> monoOut((size_t)numSamples, 0.f);
+  for (int32 s = 0; s < numSamples; s++) {
+    float acc = 0.f;
+    for (int32 c = 0; c < p.numOutCh; c++) acc += out[c][s];
+    monoOut[s] = acc / (float)p.numOutCh;
+  }
+
+  std::string outB64 = base64Encode((const uint8_t*)monoOut.data(), monoOut.size() * 4);
+  std::cout << "{\"type\":\"audio\",\"numSamples\":" << numSamples
+            << ",\"data\":\"" << outB64 << "\"}\n" << std::flush;
+}
+
 int main() {
   Plugin plugin;
   std::string line;
@@ -258,6 +418,19 @@ int main() {
       } else {
         std::cout << "{\"type\":\"error\",\"message\":\"failed to load plugin\"}\n" << std::flush;
       }
+    } else if (cmd == "setup") {
+      size_t tab2 = rest.find('\t');
+      double sampleRate = std::stod(rest.substr(0, tab2));
+      int32 blockSize = (int32)std::stoi(rest.substr(tab2 + 1));
+      if (setupProcessing(plugin, sampleRate, blockSize)) {
+        std::cout << "{\"type\":\"ready\"}\n" << std::flush;
+      } else {
+        std::cout << "{\"type\":\"error\",\"message\":\"setup failed\"}\n" << std::flush;
+      }
+    } else if (cmd == "process") {
+      size_t tab2 = rest.find('\t');
+      int32 numSamples = (int32)std::stoi(rest.substr(0, tab2));
+      processAudio(plugin, numSamples, rest.substr(tab2 + 1));
     } else if (cmd == "get") {
       if (!plugin.controller) {
         std::cout << "{\"type\":\"error\",\"message\":\"no plugin loaded\"}\n" << std::flush;
