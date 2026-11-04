@@ -12,6 +12,8 @@ class AudioProcessor {
         this.compressorNode = null;
         this.eqNodes = { low: null, mid: null, high: null };
         this.reverbNode = null;
+        this.reverbInput = null;
+        this.reverbOutput = null;
         this.deesserNode = null;
         this.gainNode = null;
         this.vstPlugins = [];
@@ -142,8 +144,8 @@ class AudioProcessor {
 
         let envelope = 0;
         let isOpen = false;
-        const attackTime = 0.001;
-        const releaseTime = 0.1;
+        const attackCoeff = 1 - Math.exp(-1 / (0.001 * this.audioContext.sampleRate));
+        const releaseCoeff = 1 - Math.exp(-1 / (0.1 * this.audioContext.sampleRate));
 
         this.gateNode.onaudioprocess = (e) => {
             const input = e.inputBuffer.getChannelData(0);
@@ -162,7 +164,7 @@ class AudioProcessor {
                 }
 
                 const target = isOpen ? 1 : 0;
-                const coeff = isOpen ? attackTime : releaseTime;
+                const coeff = isOpen ? attackCoeff : releaseCoeff;
                 envelope += (target - envelope) * coeff;
 
                 output[i] = sample * envelope;
@@ -202,8 +204,9 @@ class AudioProcessor {
         this.reverbDry = this.audioContext.createGain();
         this.reverbWet = this.audioContext.createGain();
 
-        this.reverbDry.gain.value = 0.8;
-        this.reverbWet.gain.value = 0.2;
+        const mix = this.effects.reverb.mix / 100;
+        this.reverbDry.gain.value = 1 - mix;
+        this.reverbWet.gain.value = mix;
 
         // Generate impulse response
         this.generateReverbImpulse();
@@ -211,7 +214,7 @@ class AudioProcessor {
 
     generateReverbImpulse() {
         const sampleRate = this.audioContext.sampleRate;
-        const length = sampleRate * (this.effects.reverb.size / 100) * 2;
+        const length = Math.max(1, Math.floor(sampleRate * (this.effects.reverb.size / 100) * 2));
         const impulse = this.audioContext.createBuffer(2, length, sampleRate);
 
         for (let channel = 0; channel < 2; channel++) {
@@ -277,26 +280,29 @@ class AudioProcessor {
 
         // Reverb (parallel)
         if (this.effects.reverb.enabled) {
-            const reverbInput = this.audioContext.createGain();
-            currentNode.connect(reverbInput);
+            this.reverbInput = this.audioContext.createGain();
+            currentNode.connect(this.reverbInput);
 
-            reverbInput.connect(this.reverbDry);
-            reverbInput.connect(this.reverbNode);
+            this.reverbInput.connect(this.reverbDry);
+            this.reverbInput.connect(this.reverbNode);
             this.reverbNode.connect(this.reverbWet);
 
-            const reverbOutput = this.audioContext.createGain();
-            this.reverbDry.connect(reverbOutput);
-            this.reverbWet.connect(reverbOutput);
+            this.reverbOutput = this.audioContext.createGain();
+            this.reverbDry.connect(this.reverbOutput);
+            this.reverbWet.connect(this.reverbOutput);
 
-            currentNode = reverbOutput;
+            currentNode = this.reverbOutput;
         }
 
-        // Output gain
-        currentNode.connect(this.gainNode);
+        // Output gain (bypassed when the Output effect is disabled)
+        if (this.effects.output.enabled) {
+            currentNode.connect(this.gainNode);
+            currentNode = this.gainNode;
+        }
 
         // Connect to analyser and destination
-        this.gainNode.connect(this.analyserNode);
-        this.gainNode.connect(this.audioContext.destination);
+        currentNode.connect(this.analyserNode);
+        currentNode.connect(this.audioContext.destination);
     }
 
     disconnectAudioGraph() {
@@ -316,6 +322,8 @@ class AudioProcessor {
             this.reverbDry.disconnect();
             this.reverbWet.disconnect();
         }
+        if (this.reverbInput) this.reverbInput.disconnect();
+        if (this.reverbOutput) this.reverbOutput.disconnect();
         if (this.deesserNode) this.deesserNode.disconnect();
         if (this.gainNode) this.gainNode.disconnect();
         if (this.analyserNode) this.analyserNode.disconnect();
