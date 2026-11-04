@@ -2,8 +2,10 @@ class NoiseGateProcessor extends AudioWorkletProcessor {
     constructor() {
         super();
         this.threshold = -50;
-        this.attackTime = 0.001;
-        this.releaseTime = 0.1;
+        // One-pole smoothing coefficients (per-sample).
+        // Attack time: 1 ms, release time: 100 ms.
+        this.attackCoeff = 1 - Math.exp(-1 / (0.001 * sampleRate));
+        this.releaseCoeff = 1 - Math.exp(-1 / (0.1 * sampleRate));
         this.isOpen = false;
         this.envelope = 0;
 
@@ -42,7 +44,7 @@ class NoiseGateProcessor extends AudioWorkletProcessor {
 
                 // Envelope follower
                 const target = this.isOpen ? 1 : 0;
-                const coeff = this.isOpen ? this.attackTime : this.releaseTime;
+                const coeff = this.isOpen ? this.attackCoeff : this.releaseCoeff;
                 this.envelope += (target - this.envelope) * coeff;
 
                 // Apply gate
