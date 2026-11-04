@@ -6,5 +6,6 @@ contextBridge.exposeInMainWorld('electronAPI', {
     unloadVST3: (pluginId) => ipcRenderer.invoke('unload-vst3', pluginId),
     getVST3Parameters: (pluginId) => ipcRenderer.invoke('get-vst3-params', pluginId),
     setVST3Parameter: (pluginId, paramId, value) => ipcRenderer.invoke('set-vst3-param', pluginId, paramId, value),
-    openVST3Dialog: () => ipcRenderer.invoke('open-vst3-dialog')
+    openVST3Dialog: () => ipcRenderer.invoke('open-vst3-dialog'),
+    getWorkletSource: () => ipcRenderer.invoke('get-worklet-source')
 });
