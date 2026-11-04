@@ -35,12 +35,21 @@ class AudioProcessor {
         try {
             this.audioContext = new (window.AudioContext || window.webkitAudioContext)();
 
-            // Load AudioWorklet for noise gate
+            // Load AudioWorklet for noise gate. Load it via a Blob URL when running
+            // inside Electron, because AudioWorklet module loading can fail under
+            // the file:// protocol.
             try {
-                await this.audioContext.audioWorklet.addModule('noise-gate-processor.js');
+                let moduleUrl = 'noise-gate-processor.js';
+                if (typeof window.electronAPI !== 'undefined' && window.electronAPI.getWorkletSource) {
+                    const src = await window.electronAPI.getWorkletSource();
+                    if (src) {
+                        moduleUrl = URL.createObjectURL(new Blob([src], { type: 'application/javascript' }));
+                    }
+                }
+                await this.audioContext.audioWorklet.addModule(moduleUrl);
                 console.log('AudioWorklet loaded successfully');
             } catch (e) {
-                console.warn('AudioWorklet not available, using fallback gate');
+                console.warn('AudioWorklet not available, using fallback gate', e);
             }
 
             await this.loadDevices();
@@ -139,13 +148,21 @@ class AudioProcessor {
     }
 
     setupNoiseGateFallback() {
-        const bufferSize = 4096;
+        // Time-domain RMS gate with hysteresis + hold, used only when the
+        // spectral AudioWorklet is unavailable.
+        const bufferSize = 2048;
         this.gateNode = this.audioContext.createScriptProcessor(bufferSize, 1, 1);
 
+        const sampleRate = this.audioContext.sampleRate;
+        const rmsCoeff = 1 - Math.exp(-1 / (sampleRate * 0.010)); // 10 ms RMS envelope
+        const attackCoeff = 1 - Math.exp(-1 / (sampleRate * 0.001)); // 1 ms attack
+        const releaseCoeff = 1 - Math.exp(-1 / (sampleRate * 0.100)); // 100 ms release
+        const holdSamples = Math.floor(sampleRate * 0.05); // 50 ms hold
+
+        let rmsEnv = 0;
         let envelope = 0;
-        let isOpen = false;
-        const attackCoeff = 1 - Math.exp(-1 / (0.001 * this.audioContext.sampleRate));
-        const releaseCoeff = 1 - Math.exp(-1 / (0.1 * this.audioContext.sampleRate));
+        let gateOpen = false;
+        let holdCounter = 0;
 
         this.gateNode.onaudioprocess = (e) => {
             const input = e.inputBuffer.getChannelData(0);
@@ -154,17 +171,27 @@ class AudioProcessor {
 
             for (let i = 0; i < input.length; i++) {
                 const sample = input[i];
-                const level = Math.abs(sample);
-                const dbLevel = 20 * Math.log10(level + 0.0001);
 
+                // Smooth RMS envelope (power domain).
+                rmsEnv += rmsCoeff * (sample * sample - rmsEnv);
+                const dbLevel = 10 * Math.log10(rmsEnv + 1e-12);
+
+                // Hysteresis + hold.
                 if (dbLevel > threshold) {
-                    isOpen = true;
+                    gateOpen = true;
+                    holdCounter = holdSamples;
                 } else if (dbLevel < threshold - 6) {
-                    isOpen = false;
+                    if (holdCounter > 0) {
+                        holdCounter--;
+                    } else {
+                        gateOpen = false;
+                    }
+                } else if (holdCounter > 0) {
+                    holdCounter--;
                 }
 
-                const target = isOpen ? 1 : 0;
-                const coeff = isOpen ? attackCoeff : releaseCoeff;
+                const target = gateOpen ? 1 : 0;
+                const coeff = gateOpen ? attackCoeff : releaseCoeff;
                 envelope += (target - envelope) * coeff;
 
                 output[i] = sample * envelope;
@@ -362,7 +389,8 @@ class AudioProcessor {
             const result = await window.electronAPI.loadVST3(pluginPath);
 
             if (result.success) {
-                // Create a gain node as placeholder for VST3
+                // Pass-through gain node: the real DSP runs in the native host.
+                // (Wiring plugin audio into the live graph is a separate step.)
                 const vstNode = this.audioContext.createGain();
                 vstNode.gain.value = 1;
 
@@ -371,13 +399,14 @@ class AudioProcessor {
                     name: result.name,
                     path: pluginPath,
                     node: vstNode,
-                    enabled: true
+                    enabled: true,
+                    parameters: result.parameters || []
                 };
 
                 this.vstPlugins.push(plugin);
                 this.addVSTPluginToUI(plugin);
 
-                alert(`VST3 plugin loaded: ${result.name}\n\nNote: Full VST3 processing requires native addon.`);
+                alert(`VST3 plugin loaded: ${result.name}\n${plugin.parameters.length} parameters.`);
 
                 if (this.isProcessing) {
                     this.disconnectAudioGraph();
@@ -401,7 +430,7 @@ class AudioProcessor {
 
         pluginBlock.innerHTML = `
             <div class="effect-header">
-                <span class="effect-title">🎛️ ${plugin.name}</span>
+                <span class="effect-title">🎛️ ${this.escapeHtml(plugin.name)}</span>
                 <div style="display: flex; gap: 10px; align-items: center;">
                     <label class="toggle-switch">
                         <input type="checkbox" class="vst-toggle" data-id="${plugin.id}" checked>
@@ -410,13 +439,47 @@ class AudioProcessor {
                     <button class="remove-vst-btn" data-id="${plugin.id}" title="Remove plugin">✕</button>
                 </div>
             </div>
-            <div class="control-group">
-                <p style="color: #888; font-size: 0.85rem; margin: 0;">VST3 Plugin</p>
-                <p style="color: #888; font-size: 0.75rem; margin-top: 5px;">Path: ${plugin.path}</p>
-            </div>
+            <div class="vst-params"></div>
         `;
 
         container.appendChild(pluginBlock);
+
+        // Build one slider per plugin parameter (no extra styling).
+        const paramsContainer = pluginBlock.querySelector('.vst-params');
+        (plugin.parameters || []).forEach((p) => {
+            const group = document.createElement('div');
+            group.className = 'control-group';
+
+            const label = document.createElement('div');
+            label.className = 'control-label';
+            const name = document.createElement('span');
+            name.textContent = p.title || ('Param ' + p.id);
+            const value = document.createElement('span');
+            value.className = 'control-value';
+            value.textContent = this.formatParamValue(p);
+            label.appendChild(name);
+            label.appendChild(value);
+
+            const slider = document.createElement('input');
+            slider.type = 'range';
+            slider.min = '0';
+            slider.max = '1';
+            slider.step = '0.001';
+            slider.value = String(p.value != null ? p.value : 0);
+
+            slider.addEventListener('input', () => {
+                const v = parseFloat(slider.value);
+                value.textContent = v.toFixed(3) + (p.units ? ' ' + p.units : '');
+                if (typeof window.electronAPI !== 'undefined') {
+                    window.electronAPI.setVST3Parameter(plugin.id, p.id, v)
+                        .catch((err) => console.error('setVST3Parameter failed:', err));
+                }
+            });
+
+            group.appendChild(label);
+            group.appendChild(slider);
+            paramsContainer.appendChild(group);
+        });
 
         // Add event listeners
         pluginBlock.querySelector('.vst-toggle').addEventListener('change', (e) => {
@@ -430,6 +493,20 @@ class AudioProcessor {
         pluginBlock.querySelector('.remove-vst-btn').addEventListener('click', () => {
             this.removeVSTPlugin(plugin.id);
         });
+    }
+
+    formatParamValue(p) {
+        const v = p.value != null ? p.value : 0;
+        return v.toFixed(3) + (p.units ? ' ' + p.units : '');
+    }
+
+    escapeHtml(s) {
+        return String(s)
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;')
+            .replace(/'/g, '&#39;');
     }
 
     async removeVSTPlugin(pluginId) {
