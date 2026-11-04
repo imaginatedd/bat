@@ -17,6 +17,7 @@ class AudioProcessor {
         this.deesserNode = null;
         this.gainNode = null;
         this.vstPlugins = [];
+        this.vst3BridgeAvailable = false;
 
         // Effect states
         this.effects = {
@@ -50,6 +51,22 @@ class AudioProcessor {
                 console.log('AudioWorklet loaded successfully');
             } catch (e) {
                 console.warn('AudioWorklet not available, using fallback gate', e);
+            }
+
+            // Load the VST3 bridge worklet (round-trips audio through the native host).
+            try {
+                let bridgeUrl = 'vst3-bridge-processor.js';
+                if (typeof window.electronAPI !== 'undefined' && window.electronAPI.getVst3BridgeSource) {
+                    const src = await window.electronAPI.getVst3BridgeSource();
+                    if (src) {
+                        bridgeUrl = URL.createObjectURL(new Blob([src], { type: 'application/javascript' }));
+                    }
+                }
+                await this.audioContext.audioWorklet.addModule(bridgeUrl);
+                this.vst3BridgeAvailable = true;
+                console.log('VST3 bridge worklet loaded');
+            } catch (e) {
+                console.warn('VST3 bridge worklet not available', e);
             }
 
             await this.loadDevices();
@@ -389,10 +406,8 @@ class AudioProcessor {
             const result = await window.electronAPI.loadVST3(pluginPath);
 
             if (result.success) {
-                // Pass-through gain node: the real DSP runs in the native host.
-                // (Wiring plugin audio into the live graph is a separate step.)
-                const vstNode = this.audioContext.createGain();
-                vstNode.gain.value = 1;
+                // Bridge node: round-trips audio through the native VST3 host.
+                const vstNode = this.createVst3BridgeNode(result.pluginId);
 
                 const plugin = {
                     id: result.pluginId,
@@ -507,6 +522,62 @@ class AudioProcessor {
             .replace(/>/g, '&gt;')
             .replace(/"/g, '&quot;')
             .replace(/'/g, '&#39;');
+    }
+
+    createVst3BridgeNode(pluginId) {
+        // If the bridge worklet is unavailable, fall back to a pass-through gain.
+        if (!this.vst3BridgeAvailable || typeof window.electronAPI === 'undefined') {
+            const g = this.audioContext.createGain();
+            g.gain.value = 1;
+            return g;
+        }
+
+        const blockSize = 1024; // mono samples per round-trip
+        const sabReq = new SharedArrayBuffer(blockSize * 4);
+        const sabResp = new SharedArrayBuffer(blockSize * 4);
+        const ctrl = new SharedArrayBuffer(8); // Int32Array(2): [reqReady, respReady]
+
+        const node = new AudioWorkletNode(this.audioContext, 'vst3-bridge-processor', {
+            numberOfInputs: 1,
+            numberOfOutputs: 1,
+            outputChannelCount: [1],
+            channelCount: 1,
+            channelCountMode: 'explicit',
+            channelInterpretation: 'speakers'
+        });
+
+        const ctrlView = new Int32Array(ctrl);
+        const respView = new Float32Array(sabResp);
+
+        node.port.onmessage = async (e) => {
+            if (!e.data || e.data.type !== 'process') return;
+            Atomics.store(ctrlView, 0, 0); // consume the request
+            const req = new Float32Array(sabReq);
+            const reqCopy = new Float32Array(blockSize);
+            reqCopy.set(req);
+            try {
+                const result = await window.electronAPI.processVST3(pluginId, reqCopy, {
+                    sampleRate: this.audioContext.sampleRate,
+                    blockSize
+                });
+                if (result && result.success && result.audioData) {
+                    const data = result.audioData instanceof Float32Array
+                        ? result.audioData
+                        : new Float32Array(result.audioData);
+                    respView.set(data.subarray(0, blockSize));
+                } else {
+                    respView.fill(0);
+                }
+            } catch (err) {
+                console.error('VST3 bridge round-trip failed:', err);
+                respView.fill(0);
+            }
+            Atomics.store(ctrlView, 1, 1); // response ready
+            Atomics.notify(ctrlView, 1);
+        };
+
+        node.port.postMessage({ type: 'init', sabReq, sabResp, ctrl, blockSize });
+        return node;
     }
 
     async removeVSTPlugin(pluginId) {
